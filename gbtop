@@ -17,7 +17,7 @@ import urllib.request, xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SIGNATURE = "irgNET - Hakki Cemre Guenay / https://irg-net.com"
 DEFAULT_PORT = 9755
 HIST_LEN = 300
@@ -826,7 +826,7 @@ class UI:
                 pass
             bg, black = 234, 16                              # 234 = #1C1C1C
             table = {"g": 106, "m": 150, "b": 64, "s": 108, "a": 74, "o": 208,
-                     "p": 74, "q": 117, "u": 31, "v": 67, "c": 255, "y": 220, "r": 203, "d": 245, "x": 240}
+                     "p": 74, "q": 117, "u": 31, "v": 67, "l": 250, "c": 255, "y": 220, "r": 203, "d": 245, "x": 240}
             curses.init_pair(20, 252, bg)
             scr.bkgd(" ", curses.color_pair(20))
         else:
@@ -835,7 +835,7 @@ class UI:
             table = {"g": curses.COLOR_GREEN, "m": curses.COLOR_GREEN, "b": curses.COLOR_GREEN, "s": curses.COLOR_GREEN,
                      "a": curses.COLOR_CYAN, "o": curses.COLOR_YELLOW,
                      "p": curses.COLOR_CYAN, "q": curses.COLOR_CYAN,
-                     "u": curses.COLOR_CYAN, "v": curses.COLOR_CYAN,
+                     "u": curses.COLOR_CYAN, "v": curses.COLOR_CYAN, "l": curses.COLOR_WHITE,
                      "c": curses.COLOR_WHITE, "y": curses.COLOR_YELLOW, "r": curses.COLOR_RED,
                      "d": curses.COLOR_WHITE, "x": curses.COLOR_WHITE}
         for i, (name, fg) in enumerate(table.items(), 1):
@@ -943,10 +943,12 @@ class UI:
         self.seq(iy, ix, [("RAM ", "d"), (f"{fb(mem['used'])} / {fb(mem['total'])}", "w"),
                           ("  avail ", "d"), (fb(mem["avail"]), self.pc(upct, 80, 92)),
                           ("  Swap ", "d"), (f"{fb(mem['swap_used'])} / {fb(mem['swap_total'])}", "n")])
-        syscol = "x" if s["unified"] else "p"
+        syscol = "l" if s["unified"] else "p"       # system share: light gray, clear of the background
         # memory uses the CPU's blue: the biggest GPU process gets the main tone, the rest its shades
         ranked = sorted(s["procs"], key=lambda p: (-p["gpu_mem"], p["pid"]))
         pcol = {p["pid"]: "p" if i == 0 else "quv"[(i - 1) % 3] for i, p in enumerate(ranked)}
+        # in the GPU process list the same ranking uses greens, matching the GPU bar
+        gcol = {p["pid"]: "g" if i == 0 else "mbs"[(i - 1) % 3] for i, p in enumerate(ranked)}
         segs = [(p["gpu_mem"] / tot, pcol[p["pid"]])
                 for p in sorted(s["procs"], key=lambda p: -p["gpu_mem"])] if s["unified"] else []
         self.bar(iy + 1, ix, iw - 8, segs + [((mem["used"] - gpum) / tot, syscol)])
@@ -1062,7 +1064,7 @@ class UI:
                 (f"{p['pid']:>8} ", self.c["hd"] if i == self.psel else "n"), (f"{p['user'][:9]:<10}", "n"),
                 (f"{p['type']:<4}", "g" if p["type"] == "C" else "d"),
                 (f"{p['cpu']:>6.1f}%", self.pc(p["cpu"], 150, 600)),
-                (f"{fb(p['gpu_mem']):>10}", "n"), (f"{fb(p['rss']):>10}", "n"), ("  ", "n"), ("■ ", pcol[p["pid"]])])
+                (f"{fb(p['gpu_mem']):>10}", "n"), (f"{fb(p['rss']):>10}", "n"), ("  ", "n"), ("■ ", gcol[p["pid"]])])
             if p["container"]:
                 x = self.seq(iy + 1 + i, x, [("[" + p["container"][:28] + "] ", "c")])
             self.put(iy + 1 + i, x, p["name"][:max(0, ix + iw - x)])
