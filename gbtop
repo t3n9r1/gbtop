@@ -17,7 +17,7 @@ import urllib.request, xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 SIGNATURE = "irgNET - Hakki Cemre Guenay / https://irg-net.com"
 DEFAULT_PORT = 9755
 HIST_LEN = 300
@@ -822,13 +822,13 @@ class UI:
             except curses.error:
                 pass
             bg, black = 234, 16                              # 234 = #1C1C1C
-            table = {"g": 106, "m": 150, "b": 64, "c": 255, "y": 214, "r": 203, "d": 245, "x": 240}
+            table = {"g": 106, "m": 150, "b": 64, "s": 108, "c": 255, "y": 214, "r": 203, "d": 245, "x": 240}
             curses.init_pair(20, 252, bg)
             scr.bkgd(" ", curses.color_pair(20))
         else:
             curses.use_default_colors()
             bg, black = -1, curses.COLOR_BLACK
-            table = {"g": curses.COLOR_GREEN, "m": curses.COLOR_GREEN, "b": curses.COLOR_GREEN,
+            table = {"g": curses.COLOR_GREEN, "m": curses.COLOR_GREEN, "b": curses.COLOR_GREEN, "s": curses.COLOR_GREEN,
                      "c": curses.COLOR_WHITE, "y": curses.COLOR_YELLOW, "r": curses.COLOR_RED,
                      "d": curses.COLOR_WHITE, "x": curses.COLOR_WHITE}
         for i, (name, fg) in enumerate(table.items(), 1):
@@ -936,7 +936,9 @@ class UI:
                           ("  avail ", "d"), (fb(mem["avail"]), self.pc(upct, 80, 92)),
                           ("  Swap ", "d"), (f"{fb(mem['swap_used'])} / {fb(mem['swap_total'])}", "n")])
         syscol = "d" if s["unified"] else "g"
-        pcol = {pid: "gmbc"[i % 4] for i, pid in enumerate(sorted(p["pid"] for p in s["procs"]))}
+        # biggest GPU process gets NVIDIA green, the rest rotate through quieter greens
+        ranked = sorted(s["procs"], key=lambda p: (-p["gpu_mem"], p["pid"]))
+        pcol = {p["pid"]: "g" if i == 0 else "mbs"[(i - 1) % 3] for i, p in enumerate(ranked)}
         segs = [(p["gpu_mem"] / tot, pcol[p["pid"]])
                 for p in sorted(s["procs"], key=lambda p: -p["gpu_mem"])] if s["unified"] else []
         self.bar(iy + 1, ix, iw - 8, segs + [((mem["used"] - gpum) / tot, syscol)])
@@ -950,7 +952,7 @@ class UI:
             parts += [("  pressure ", "d"), (f"{mem['psi']:.1f}%", self.pc(mem["psi"], 5, 20))]
         self.seq(iy + 2, ix, parts)
         self.put(iy + 3, ix, "hist", self.c["d"])
-        self.spark(iy + 3, ix + 5, iw - 5, hist["mem"], "m", 100)
+        self.spark(iy + 3, ix + 5, iw - 5, hist["mem"], "b", 100)
         y += 6
 
         # GPU
@@ -978,7 +980,7 @@ class UI:
         self.put(r, ix, "util", self.c["d"])
         self.spark(r, ix + 5, hw, hist["gpu"], "g", 100)
         self.put(r, ix + 7 + hw, "watt", self.c["d"])
-        self.spark(r, ix + 12 + hw, hw, hist["power"], "m", max(hist["power"][-max(1, hw):] + [60]))
+        self.spark(r, ix + 12 + hw, hw, hist["power"], "b", max(hist["power"][-max(1, hw):] + [60]))
         y += gh
 
         # vLLM
@@ -1118,7 +1120,7 @@ class UI:
                 self.put(iy + i, ix + 27, "GPU", self.c["d"])
                 self.spark(iy + i, ix + 31, hw, n.snap["hist"]["gpu"], "g", 100)
                 self.put(iy + i, ix + 33 + hw, "tok/s", self.c["d"])
-                self.spark(iy + i, ix + 39 + hw, hw, n.snap["hist"]["tps"], "m")
+                self.spark(iy + i, ix + 39 + hw, hw, n.snap["hist"]["tps"], "b")
         y += len(self.nodes) + 2
         # alerts of all nodes
         al = [(n.name, a) for n in self.nodes if n.snap and n.ok for a in n.snap["alerts"]]
