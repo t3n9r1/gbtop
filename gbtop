@@ -1,0 +1,1297 @@
+#!/usr/bin/env python3
+"""gbtop - terminal monitor for NVIDIA GB10 (DGX Spark, Dell Pro Max GB10) with
+vLLM metrics and a mesh view. Python standard library only, single file.
+
+  gbtop                           local view
+  gbtop --nodes hostA,user@hostB  local view plus mesh nodes, agentless over SSH
+  gbtop --once                    one snapshot as JSON (for debugging)
+  gbtop --serve                   optional HTTP endpoint with Prometheus /metrics
+
+Mesh nodes need nothing installed except python3 and key-based SSH access:
+gbtop pipes itself through "ssh host python3 -" and reads the node's data
+from that connection. Install: sudo install -m 755 gbtop /usr/local/bin/gbtop
+"""
+import argparse, collections, ctypes, curses, hmac, json, locale, os, pwd, re
+import shlex, signal, socket, subprocess, sys, threading, time
+import urllib.request, xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+VERSION = "0.1.0"
+SIGNATURE = "irgNET - Hakki Cemre Guenay / https://irg-net.com"
+DEFAULT_PORT = 9755
+HIST_LEN = 300
+HIST_FILE = os.path.expanduser("~/.cache/gbtop/history.json")
+NODES_FILE = os.path.expanduser("~/.config/gbtop/nodes")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def read(path, default=None):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return default
+
+
+def num(text):
+    """'33 C' -> 33.0, 'N/A' -> None"""
+    m = re.match(r"\s*(-?\d+(?:\.\d+)?)", text or "")
+    return float(m.group(1)) if m else None
+
+
+def http_get(url, timeout=1.5, token=None):
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with NO_PROXY.open(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+# ───────────────────────────── GPU: NVML directly, else nvidia-smi ─────────────
+
+class _Util(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _Mem(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+class _Proc(ctypes.Structure):
+    _fields_ = [("pid", ctypes.c_uint), ("mem", ctypes.c_ulonglong),
+                ("gi", ctypes.c_uint), ("ci", ctypes.c_uint)]
+
+
+class Nvml:
+    """Minimal NVML binding via ctypes (no nvidia-smi call every second)."""
+    NA = 0xFFFFFFFFFFFFFFFF
+
+    def __init__(self):
+        L = self.L = ctypes.CDLL("libnvidia-ml.so.1")
+        vp, u, P = ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER
+        sig = {
+            "nvmlInit_v2": [],
+            "nvmlDeviceGetCount_v2": [P(u)],
+            "nvmlDeviceGetHandleByIndex_v2": [u, P(vp)],
+            "nvmlDeviceGetName": [vp, ctypes.c_char_p, u],
+            "nvmlSystemGetDriverVersion": [ctypes.c_char_p, u],
+            "nvmlDeviceGetTemperature": [vp, ctypes.c_int, P(u)],
+            "nvmlDeviceGetPowerUsage": [vp, P(u)],
+            "nvmlDeviceGetUtilizationRates": [vp, P(_Util)],
+            "nvmlDeviceGetClockInfo": [vp, ctypes.c_int, P(u)],
+            "nvmlDeviceGetMemoryInfo": [vp, P(_Mem)],
+            "nvmlDeviceGetComputeRunningProcesses_v3": [vp, P(u), P(_Proc)],
+            "nvmlDeviceGetGraphicsRunningProcesses_v3": [vp, P(u), P(_Proc)],
+        }
+        for name, args in sig.items():
+            fn = getattr(L, name)
+            fn.argtypes, fn.restype = args, ctypes.c_int
+        if L.nvmlInit_v2() != 0:
+            raise OSError("nvmlInit failed")
+        n = u(0)
+        if L.nvmlDeviceGetCount_v2(ctypes.byref(n)) != 0:
+            raise OSError("nvmlDeviceGetCount failed")
+        self.handles = []
+        for i in range(n.value):
+            h = vp()
+            if L.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h)) == 0:
+                self.handles.append(h)
+        buf = ctypes.create_string_buffer(96)
+        self.driver = buf.value.decode() if L.nvmlSystemGetDriverVersion(buf, 96) == 0 else "?"
+
+    def _uint(self, fn, h, *pre):
+        v = ctypes.c_uint(0)
+        return v.value if fn(h, *pre, ctypes.byref(v)) == 0 else None
+
+    def _procs(self, fn, h, typ, gi):
+        n = ctypes.c_uint(0)
+        rc = fn(h, ctypes.byref(n), None)
+        if rc not in (0, 7) or n.value == 0:      # 7 = INSUFFICIENT_SIZE
+            return []
+        n = ctypes.c_uint(n.value + 16)
+        arr = (_Proc * n.value)()
+        if fn(h, ctypes.byref(n), arr) != 0:
+            return []
+        return [{"pid": arr[i].pid, "type": typ, "gpu": gi,
+                 "gpu_mem": None if arr[i].mem == self.NA else arr[i].mem}
+                for i in range(n.value)]
+
+    def sample(self):
+        L, gpus, procs = self.L, [], []
+        for gi, h in enumerate(self.handles):
+            buf = ctypes.create_string_buffer(96)
+            name = buf.value.decode() if L.nvmlDeviceGetName(h, buf, 96) == 0 else "GPU"
+            util, mem = _Util(), _Mem()
+            u_ok = L.nvmlDeviceGetUtilizationRates(h, ctypes.byref(util)) == 0
+            m_ok = L.nvmlDeviceGetMemoryInfo(h, ctypes.byref(mem)) == 0 and mem.total > 0
+            pw = self._uint(L.nvmlDeviceGetPowerUsage, h)
+            gpus.append({
+                "name": name, "util": float(util.gpu) if u_ok else None,
+                "temp": self._uint(L.nvmlDeviceGetTemperature, h, 0),
+                "power": pw / 1000.0 if pw is not None else None,
+                "clock": self._uint(L.nvmlDeviceGetClockInfo, h, 0),
+                "mem_total": mem.total if m_ok else None,
+                "mem_used": mem.used if m_ok else None})
+            procs += self._procs(L.nvmlDeviceGetComputeRunningProcesses_v3, h, "C", gi)
+            procs += self._procs(L.nvmlDeviceGetGraphicsRunningProcesses_v3, h, "G", gi)
+        return gpus, procs, self.driver
+
+
+def smi_sample():
+    """Fallback: parse nvidia-smi -q -x."""
+    out = subprocess.run(["nvidia-smi", "-q", "-x"], capture_output=True, text=True,
+                         timeout=8).stdout
+    root = ET.fromstring(out)
+    gpus, procs = [], []
+
+    def first(node, *tags):
+        for t in tags:
+            e = node.find(".//" + t)
+            if e is not None and num(e.text) is not None:
+                return num(e.text)
+        return None
+
+    for gi, g in enumerate(root.findall("gpu")):
+        tot = first(g, "fb_memory_usage/total")
+        used = first(g, "fb_memory_usage/used")
+        gpus.append({
+            "name": (g.findtext("product_name") or "GPU").strip(),
+            "util": first(g, "utilization/gpu_util"),
+            "temp": first(g, "temperature/gpu_temp"),
+            "power": first(g, "instant_power_draw", "power_draw", "average_power_draw"),
+            "clock": first(g, "clocks/graphics_clock"),
+            "mem_total": int(tot * 2**20) if tot else None,
+            "mem_used": int(used * 2**20) if tot and used is not None else None})
+        for p in g.findall(".//process_info"):
+            pid, mem = num(p.findtext("pid")), num(p.findtext("used_memory"))
+            if pid is not None:
+                procs.append({"pid": int(pid), "type": (p.findtext("type") or "?").strip(),
+                              "gpu": gi, "gpu_mem": int(mem * 2**20) if mem is not None else None})
+    return gpus, procs, (root.findtext("driver_version") or "?").strip()
+
+
+# ───────────────────────────── Collector ────────────────────────────────────────
+
+class Collector:
+    def __init__(self, interval=2.0, vllm_urls=None, use_nvml=True, persist=False):
+        self.interval = interval
+        self.vllm_urls = vllm_urls or ["http://127.0.0.1:8000"]
+        self.persist = persist
+        self.host = socket.gethostname()
+        self.nvml = None
+        self.gpu_src = "-"
+        if use_nvml:
+            try:
+                self.nvml = Nvml()
+                self.gpu_src = "nvml"
+            except Exception:
+                self.nvml = None
+        self.prev = {}
+        self.pcpu = {}
+        self.vprev = {}
+        self.docker = ({}, 0.0)
+        self.hist = {k: collections.deque(maxlen=HIST_LEN)
+                     for k in ("cpu", "mem", "gpu", "power", "tps")}
+        if persist:
+            self._load_hist()
+        self.snap = None
+        self.saved = time.time()
+        self.stop = threading.Event()
+
+    # -- history across restarts
+    def _load_hist(self):
+        try:
+            d = json.loads(read(HIST_FILE) or "")
+            if time.time() - d["ts"] < 3600 and d.get("host") == self.host:
+                for k in self.hist:
+                    self.hist[k].extend(d["hist"].get(k, []))
+        except Exception:
+            pass
+
+    def save_hist(self):
+        if not self.persist:
+            return
+        self.saved = time.time()
+        try:
+            os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+            with open(HIST_FILE, "w") as f:
+                json.dump({"ts": time.time(), "host": self.host,
+                           "hist": {k: list(v) for k, v in self.hist.items()}}, f)
+        except OSError:
+            pass
+
+    def _rate(self, key, value, now):
+        old = self.prev.get(key)
+        self.prev[key] = (value, now)
+        if not old or now <= old[1] or value < old[0]:
+            return 0.0
+        return (value - old[0]) / (now - old[1])
+
+    # -- CPU
+    def cpu(self, now):
+        cores, tot = [], {}
+        for line in (read("/proc/stat") or "").splitlines():
+            if not line.startswith("cpu"):
+                continue
+            p = line.split()
+            v = [int(x) for x in p[1:9]]
+            total, idle = sum(v), v[3] + v[4]
+            old = self.prev.get("c" + p[0])
+            self.prev["c" + p[0]] = (v, total)
+            if old and total > old[1]:
+                dt = total - old[1]
+                d = [a - b for a, b in zip(v, old[0])]
+                util = 100.0 * (1 - (d[3] + d[4]) / dt)
+                if p[0] == "cpu":
+                    tot = {"util": util, "usr": 100.0 * (d[0] + d[1]) / dt,
+                           "sys": 100.0 * (d[2] + d[5] + d[6]) / dt,
+                           "iowait": 100.0 * d[4] / dt}
+                else:
+                    cores.append(round(util, 1))
+            elif p[0] != "cpu":
+                cores.append(0.0)
+        la = (read("/proc/loadavg") or "0 0 0 0/0").split()
+        freqs = []
+        for i in range(len(cores)):
+            f = read(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq")
+            if f:
+                freqs.append(int(f) / 1000.0)
+        return {"util": tot.get("util", 0.0), "usr": tot.get("usr", 0.0),
+                "sys": tot.get("sys", 0.0), "iowait": tot.get("iowait", 0.0),
+                "cores": cores, "load": [float(x) for x in la[:3]],
+                "tasks": la[3] if len(la) > 3 else "",
+                "freq": sum(freqs) / len(freqs) if freqs else None,
+                "freq_max": max(freqs) if freqs else None}
+
+    # -- memory
+    def mem(self):
+        m = {}
+        for line in (read("/proc/meminfo") or "").splitlines():
+            k, _, v = line.partition(":")
+            m[k] = int(v.split()[0]) * 1024
+        psi = None
+        t = read("/proc/pressure/memory")
+        if t:
+            mm = re.search(r"some avg10=([\d.]+)", t)
+            psi = float(mm.group(1)) if mm else None
+        total, avail = m.get("MemTotal", 0), m.get("MemAvailable", 0)
+        return {"total": total, "avail": avail, "used": total - avail,
+                "cache": m.get("Cached", 0) + m.get("SReclaimable", 0),
+                "buf": m.get("Buffers", 0), "swap_total": m.get("SwapTotal", 0),
+                "swap_used": m.get("SwapTotal", 0) - m.get("SwapFree", 0), "psi": psi}
+
+    # -- temperatures
+    def temps(self):
+        out = {}
+        base = "/sys/class/hwmon"
+        try:
+            mons = sorted(os.listdir(base))
+        except OSError:
+            return out
+        for h in mons:
+            name = (read(f"{base}/{h}/name") or h).strip()
+            try:
+                files = os.listdir(f"{base}/{h}")
+            except OSError:
+                continue
+            for f in sorted(files):
+                m = re.match(r"temp(\d+)_input$", f)
+                if not m:
+                    continue
+                v = num(read(f"{base}/{h}/{f}"))
+                if v is None:
+                    continue
+                label = (read(f"{base}/{h}/temp{m.group(1)}_label") or "").strip()
+                mx = num(read(f"{base}/{h}/temp{m.group(1)}_max"))
+                key = name + ("/" + label if label else "")
+                while key in out:
+                    key += "'"
+                out[key] = {"t": v / 1000.0, "max": mx / 1000.0 if mx else None}
+        return out
+
+    # -- Disk
+    def disks(self, now):
+        io = []
+        for line in (read("/proc/diskstats") or "").splitlines():
+            p = line.split()
+            if len(p) < 10 or not os.path.exists("/sys/block/" + p[2]):
+                continue
+            if p[2].startswith(("loop", "ram", "zram", "dm-")):
+                continue
+            io.append({"dev": p[2],
+                       "read": self._rate("dr" + p[2], int(p[5]) * 512, now),
+                       "write": self._rate("dw" + p[2], int(p[9]) * 512, now)})
+        fs, seen = [], set()
+        for line in (read("/proc/mounts") or "").splitlines():
+            p = line.split()
+            if len(p) < 3 or not p[0].startswith("/dev/") or p[0] in seen:
+                continue
+            if p[0].startswith("/dev/loop") or p[2] in ("squashfs", "vfat"):
+                continue
+            seen.add(p[0])
+            try:
+                st = os.statvfs(p[1])
+            except OSError:
+                continue
+            total = st.f_blocks * st.f_frsize
+            if total:
+                fs.append({"dev": p[0][5:], "mount": p[1], "total": total,
+                           "used": total - st.f_bavail * st.f_frsize})
+        return io, fs
+
+    # -- network
+    def net(self, now):
+        out = []
+        for line in (read("/proc/net/dev") or "").splitlines()[2:]:
+            name, _, rest = line.partition(":")
+            name, p = name.strip(), rest.split()
+            if len(p) < 16 or name == "lo" or name.startswith(("veth", "docker", "br-", "virbr")):
+                continue
+            state = (read(f"/sys/class/net/{name}/operstate") or "?").strip()
+            speed = num(read(f"/sys/class/net/{name}/speed"))
+            out.append({"if": name, "state": state,
+                        "speed": int(speed) if speed and speed > 0 else None,
+                        "rx": self._rate("nr" + name, int(p[0]), now),
+                        "tx": self._rate("nt" + name, int(p[8]), now),
+                        "err": int(p[2]) + int(p[10]), "drop": int(p[3]) + int(p[11])})
+        out.sort(key=lambda n: (n["state"] != "up", n["if"]))
+        return out
+
+    # -- processes
+    def _docker_names(self, now):
+        names, ts = self.docker
+        if now - ts > 15:
+            names = {}
+            try:
+                r = subprocess.run(["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"],
+                                   capture_output=True, text=True, timeout=3)
+                for line in r.stdout.splitlines():
+                    i, _, n = line.partition("\t")
+                    names[i] = n
+            except Exception:
+                pass
+            self.docker = (names, now)
+        return names
+
+    @staticmethod
+    def _pretty(argv):
+        if not argv:
+            return "?"
+        joined = " ".join(argv)
+        if "vllm" in joined:
+            model = None
+            for i, a in enumerate(argv):
+                if a == "serve" and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    model = argv[i + 1]
+                if a in ("--model", "--served-model-name") and i + 1 < len(argv):
+                    model = model or argv[i + 1]
+            return "vllm " + (model or "serve")
+        a0 = os.path.basename(argv[0])
+        if a0.startswith("python") and len(argv) > 2 and argv[1] == "-c":
+            return a0 + " -c … " + " ".join(argv[3:6])
+        if a0.startswith("python") and len(argv) > 1:
+            rest = [a for a in argv[1:] if not a.startswith("-") or a == "-m"]
+            return a0 + " " + " ".join(os.path.basename(x) if "/" in x else x for x in rest[:3])
+        return (a0 + " " + " ".join(argv[1:3])).strip()
+
+    def procs(self, raw, now):
+        merged = {}
+        for p in raw:
+            m = merged.setdefault(p["pid"], dict(p, gpu_mem=0))
+            m["gpu_mem"] += p["gpu_mem"] or 0
+            if p["type"] == "C":
+                m["type"] = "C"
+        dock, out, alive = None, [], {}
+        for pid, p in merged.items():
+            stat = read(f"/proc/{pid}/stat")
+            if not stat:
+                p.update(user="?", cpu=0.0, rss=0, name="(pid not visible)", container=None, argv=[])
+                out.append(p)
+                continue
+            f = stat[stat.rfind(")") + 2:].split()
+            ticks = int(f[11]) + int(f[12])
+            old = self.pcpu.get(pid)
+            alive[pid] = (ticks, now)
+            p["cpu"] = 100.0 * (ticks - old[0]) / CLK_TCK / (now - old[1]) if old and now > old[1] else 0.0
+            statm = (read(f"/proc/{pid}/statm") or "0 0").split()
+            p["rss"] = int(statm[1]) * PAGE
+            try:
+                p["user"] = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+            except (KeyError, OSError):
+                p["user"] = "?"
+            argv = [a for a in (read(f"/proc/{pid}/cmdline") or "").split("\0") if a]
+            p["argv"] = argv
+            p["name"] = self._pretty(argv) if argv else stat[stat.find("(") + 1:stat.rfind(")")]
+            p["name"] = re.sub(r"\s+", " ", "".join(c if c.isprintable() else " " for c in p["name"]))[:160]
+            p["container"] = None
+            m = re.search(r"docker[-/]([0-9a-f]{64})", read(f"/proc/{pid}/cgroup") or "")
+            if m:
+                if dock is None:
+                    dock = self._docker_names(now)
+                p["container"] = dock.get(m.group(1), m.group(1)[:12])
+            out.append(p)
+        self.pcpu = alive
+        return out
+
+    # -- vLLM
+    def vllm(self, procs, now):
+        urls = list(self.vllm_urls)
+        for p in procs:
+            argv = p.get("argv") or []
+            if any("vllm" in a for a in argv):
+                for i, a in enumerate(argv):
+                    if a == "--port" and i + 1 < len(argv) and argv[i + 1].isdigit():
+                        u = "http://127.0.0.1:" + argv[i + 1]
+                        if u not in urls:
+                            urls.append(u)
+        out = []
+        for url in urls:
+            e = {"url": url, "ok": False}
+            try:
+                text = http_get(url.rstrip("/") + "/metrics", timeout=0.8)
+            except Exception:
+                out.append(e)
+                continue
+            tot, models = collections.defaultdict(float), set()
+            for line in text.splitlines():
+                if not line.startswith("vllm:"):
+                    continue
+                m = re.match(r"vllm:([A-Za-z0-9_]+)(\{[^}]*\})?\s+(\S+)", line)
+                if not m:
+                    continue
+                try:
+                    tot[m.group(1)] += float(m.group(3))
+                except ValueError:
+                    continue
+                mm = re.search(r'model_name="([^"]*)"', m.group(2) or "")
+                if mm:
+                    models.add(mm.group(1))
+            if not tot:
+                out.append(e)
+                continue
+
+            def g(*names):
+                for n in names:
+                    if n in tot:
+                        return tot[n]
+                return None
+
+            def r(*names):
+                v = g(*names)
+                return self._rate(url + names[0], v, now) if v is not None else 0.0
+
+            def mean(base):
+                s, c = g(base + "_sum"), g(base + "_count")
+                if s is None or c is None:
+                    return None
+                old = self.vprev.get(url + base)
+                self.vprev[url + base] = (s, c) + ((old[2],) if old else (None,))
+                if old and c > old[1]:
+                    val = (s - old[0]) / (c - old[1])
+                    self.vprev[url + base] = (s, c, val)
+                    return val
+                return old[2] if old else (s / c if c else None)
+
+            kv = g("kv_cache_usage_perc", "gpu_cache_usage_perc")
+            e.update(ok=True, models=sorted(models),
+                     running=g("num_requests_running") or 0, waiting=g("num_requests_waiting") or 0,
+                     gen_tps=r("generation_tokens_total", "generation_tokens"),
+                     prompt_tps=r("prompt_tokens_total", "prompt_tokens"),
+                     req_rate=r("request_success_total", "request_success"),
+                     kv=kv * 100.0 if kv is not None else None,
+                     ttft=mean("time_to_first_token_seconds"),
+                     e2e=mean("e2e_request_latency_seconds"))
+            out.append(e)
+        return out
+
+    # -- alerts
+    @staticmethod
+    def alerts(s):
+        a = []
+        m = s["mem"]
+        if m["total"]:
+            free = 100.0 * m["avail"] / m["total"]
+            if free < 8:
+                a.append(("crit", f"memory almost full: only {free:.0f} % available"))
+            elif free < 15:
+                a.append(("warn", f"memory low: {free:.0f} % available"))
+        if m["swap_used"] > 2**30:
+            a.append(("warn", f"swap in use: {m['swap_used'] / 2**30:.1f} GiB"))
+        if m["psi"] is not None and m["psi"] > 10:
+            a.append(("warn", f"memory pressure (PSI some avg10) {m['psi']:.0f} %"))
+        for i, g in enumerate(s["gpus"]):
+            if g["temp"] is not None and g["temp"] >= 85:
+                a.append(("crit" if g["temp"] >= 92 else "warn", f"GPU {i} hot: {g['temp']:.0f} °C"))
+            if (g["util"] or 0) >= 80 and g["clock"] and g["clock"] < 1000:
+                a.append(("warn", f"GPU {i} only {g['clock']:.0f} MHz under load - possibly throttled"))
+        if s["cpu"].get("temp") and s["cpu"]["temp"] >= 90:
+            a.append(("warn", f"CPU hot: {s['cpu']['temp']:.0f} °C"))
+        for k, t in s["temps"].items():
+            if k.startswith("nvme") and t["max"] and t["t"] >= t["max"]:
+                a.append(("warn", f"NVMe hot: {t['t']:.0f} °C"))
+        for f in s["fs"]:
+            if f["used"] / f["total"] > 0.92:
+                a.append(("warn", f"{f['mount']} {100 * f['used'] / f['total']:.0f} % full"))
+        for v in s["vllm"]:
+            if v["ok"] and v["waiting"] >= 1:
+                a.append(("info", f"vLLM {urlparse(v['url']).port}: {v['waiting']:.0f} requests waiting"))
+        return [{"level": l, "msg": t} for l, t in a]
+
+    def sample(self):
+        now = time.time()
+        s = {"v": VERSION, "host": self.host, "ts": now,
+             "kernel": os.uname().release, "arch": os.uname().machine,
+             "uptime": num(read("/proc/uptime")) or 0}
+        s["cpu"] = self.cpu(now)
+        s["mem"] = self.mem()
+        s["temps"] = self.temps()
+        ct = [t["t"] for k, t in s["temps"].items()
+              if k.startswith(("acpitz", "coretemp", "k10temp", "cpu", "soc"))]
+        s["cpu"]["temp"] = max(ct) if ct else None
+        gpus, raw, driver = [], [], "?"
+        try:
+            if self.nvml:
+                gpus, raw, driver = self.nvml.sample()
+            else:
+                gpus, raw, driver = smi_sample()
+                self.gpu_src = "nvidia-smi"
+        except Exception as ex:
+            s["gpu_error"] = str(ex)[:120]
+        s["gpus"], s["driver"], s["gpu_src"] = gpus, driver, self.gpu_src
+        procs = self.procs(raw, now)
+        s["vllm"] = self.vllm(procs, now)
+        for p in procs:
+            p.pop("argv", None)
+        s["procs"] = procs
+        s["gpu_proc_mem"] = sum(p["gpu_mem"] for p in procs)
+        s["unified"] = bool(gpus) and all(g["mem_total"] is None for g in gpus)
+        s["disks"], s["fs"] = self.disks(now)
+        s["net"] = self.net(now)
+        s["alerts"] = self.alerts(s)
+        utils = [g["util"] for g in gpus if g["util"] is not None]
+        h = self.hist
+        h["cpu"].append(round(s["cpu"]["util"], 1))
+        h["mem"].append(round(100.0 * s["mem"]["used"] / max(1, s["mem"]["total"]), 1))
+        h["gpu"].append(round(sum(utils) / len(utils), 1) if utils else 0)
+        h["power"].append(round(sum(g["power"] or 0 for g in gpus), 1))
+        h["tps"].append(round(sum(v.get("gen_tps", 0) for v in s["vllm"] if v["ok"]), 1))
+        s["hist"] = {k: list(v)[-160:] for k, v in h.items()}
+        return s
+
+    def run(self):
+        self.snap = self.sample()
+        time.sleep(0.3)
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                self.snap = self.sample()
+            except Exception as ex:                      # collector must never die
+                if self.snap:
+                    self.snap = dict(self.snap, collector_error=str(ex)[:160])
+            if time.time() - self.saved > 60:
+                self.save_hist()
+            self.stop.wait(max(0.2, self.interval - (time.time() - t0)))
+
+
+# ───────────────────────────── Agent (HTTP) ───────────────────────────────────
+
+def prometheus(s):
+    L = [f'gbtop_cpu_util_percent {s["cpu"]["util"]:.2f}',
+         f'gbtop_mem_total_bytes {s["mem"]["total"]}',
+         f'gbtop_mem_available_bytes {s["mem"]["avail"]}',
+         f'gbtop_swap_used_bytes {s["mem"]["swap_used"]}',
+         f'gbtop_gpu_process_memory_bytes {s["gpu_proc_mem"]}']
+    for i, g in enumerate(s["gpus"]):
+        for key, name in (("util", "gpu_util_percent"), ("temp", "gpu_temp_celsius"),
+                          ("power", "gpu_power_watts"), ("clock", "gpu_clock_mhz")):
+            if g[key] is not None:
+                L.append(f'gbtop_{name}{{gpu="{i}"}} {g[key]}')
+    for v in s["vllm"]:
+        if v["ok"]:
+            lab = f'{{endpoint="{v["url"]}"}}'
+            L += [f'gbtop_vllm_generation_tokens_per_second{lab} {v["gen_tps"]:.2f}',
+                  f'gbtop_vllm_requests_running{lab} {v["running"]}',
+                  f'gbtop_vllm_requests_waiting{lab} {v["waiting"]}']
+    return "\n".join(L) + "\n"
+
+
+def serve(col, bind, port, token):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if token:
+                got = self.headers.get("Authorization", "")[7:] or parse_qs(u.query).get("token", [""])[0]
+                if not hmac.compare_digest(got, token):
+                    self.send_error(401)
+                    return
+            s = col.snap
+            if u.path == "/api/snapshot" and s:
+                body, ctype = json.dumps(s).encode(), "application/json"
+            elif u.path == "/metrics" and s:
+                body, ctype = prometheus(s).encode(), "text/plain; version=0.0.4"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer((bind, port), H)
+    srv.daemon_threads = True
+    return srv
+
+
+class Remote:
+    """Fetches snapshots from a remote agent."""
+    def __init__(self, spec, interval, stop):
+        parts = spec.split()
+        self.token = parts[1] if len(parts) > 1 else None
+        hp = parts[0]
+        if "://" not in hp:
+            if ":" not in hp:
+                hp += f":{DEFAULT_PORT}"
+            hp = "http://" + hp
+        self.url = hp.rstrip("/") + "/api/snapshot"
+        self.name = self.addr = urlparse(hp).hostname
+        self.snap, self.ok, self.err, self.lat, self.last = None, False, "connecting ...", None, 0
+        self.interval, self.stop = interval, stop
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                self.snap = json.loads(http_get(self.url, timeout=2.5, token=self.token))
+                self.name = f"{self.snap.get('host', '?')} ({self.addr})"
+                self.lat, self.ok, self.err, self.last = (time.time() - t0) * 1000, True, "", time.time()
+            except Exception as ex:
+                self.ok, self.err = False, str(getattr(ex, "reason", ex))[:40]
+            self.stop.wait(self.interval)
+
+
+class SSHNode:
+    """Agentless node: runs this very script on the remote host through ssh
+    (source piped to 'python3 -') and reads one JSON snapshot per line."""
+    def __init__(self, target, interval, stop, extra=""):
+        self.target = self.name = target
+        self.interval, self.stop = interval, stop
+        self.snap, self.err, self.lat, self.last, self.proc = None, "connecting ...", None, 0.0, None
+        self.cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+                    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                    target, f"python3 -u - --emit -i {interval:g} {extra}"]
+        threading.Thread(target=self.run, daemon=True).start()
+        threading.Thread(target=self.ping, daemon=True).start()
+
+    @property
+    def ok(self):
+        return self.snap is not None and time.time() - self.last < 3 * self.interval + 4
+
+    def run(self):
+        with open(os.path.abspath(__file__), "rb") as f:
+            src = f.read()
+        while not self.stop.is_set():
+            try:
+                p = self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE,
+                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    p.stdin.write(src)
+                    p.stdin.close()
+                except OSError:
+                    pass
+                for line in p.stdout:
+                    try:
+                        snap = json.loads(line)
+                    except ValueError:
+                        continue                     # e.g. output of a remote shell profile
+                    self.snap, self.last, self.err = snap, time.time(), ""
+                    self.name = f"{snap.get('host', '?')} ({self.target})"
+                msg = p.stderr.read().decode("utf-8", "replace").strip().splitlines()
+                p.wait()
+                self.err = (msg[-1] if msg else f"ssh exited with code {p.returncode}")[:70]
+            except OSError as ex:
+                self.err = str(ex)[:70]
+            self.stop.wait(5)
+
+    def ping(self):
+        """Network latency = TCP connect time to the node's SSH port."""
+        host, port = self.target.split("@")[-1], 22
+        try:
+            cfg = subprocess.run(["ssh", "-G", self.target], capture_output=True, text=True, timeout=5).stdout
+            for line in cfg.splitlines():
+                k, _, v = line.partition(" ")
+                if k == "hostname":
+                    host = v.strip()
+                elif k == "port":
+                    port = int(v)
+        except Exception:
+            pass
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                socket.create_connection((host, port), timeout=2).close()
+                self.lat = (time.time() - t0) * 1000
+            except OSError:
+                self.lat = None
+            self.stop.wait(5)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
+class Local:
+    def __init__(self, col):
+        self.col, self.name, self.ok, self.err, self.lat = col, col.host, True, "", 0.0
+
+    @property
+    def snap(self):
+        return self.col.snap
+
+
+# ───────────────────────────── UI ────────────────────────────────────
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def fb(n):
+    if n is None:
+        return "n/a"
+    for unit, d in (("TiB", 2**40), ("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+        if n >= d:
+            v = n / d
+            return f"{v:.0f} {unit}" if v >= 100 else f"{v:.1f} {unit}"
+    return f"{n:.0f} B"
+
+
+def fr(n):
+    return fb(n) + "/s"
+
+
+def fv(v, fmt="{:.0f}", unit=""):
+    return "n/a" if v is None else fmt.format(v) + unit
+
+
+def fup(sec):
+    d, r = divmod(int(sec), 86400)
+    h, r = divmod(r, 3600)
+    return (f"{d}d " if d else "") + f"{h}h {r // 60:02d}m"
+
+
+class UI:
+    def __init__(self, scr, nodes, col, interval):
+        self.scr, self.nodes, self.col = scr, nodes, col
+        self.interval = interval
+        self.view = "mesh" if len(nodes) > 1 else "node"
+        self.sel = 0          # selected node
+        self.sort = 0
+        self.help = False
+        self.psel, self.cur_procs, self.msg = 0, [], ""
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.c = {}
+        dim = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
+        for i, (name, col_) in enumerate((("g", curses.COLOR_GREEN), ("y", curses.COLOR_YELLOW),
+                                          ("r", curses.COLOR_RED), ("c", curses.COLOR_CYAN),
+                                          ("m", curses.COLOR_MAGENTA), ("b", curses.COLOR_BLUE),
+                                          ("d", dim)), 1):
+            curses.init_pair(i, col_, -1)
+            self.c[name] = curses.color_pair(i)
+        self.c["w"] = curses.A_BOLD
+        self.c["n"] = 0
+        scr.timeout(250)
+
+    # -- drawing helpers
+    def put(self, y, x, text, attr=0):
+        if y < 0 or y >= self.H or x >= self.clip or x < 0:
+            return
+        try:
+            self.scr.addstr(y, x, str(text)[:self.clip - x], attr)
+        except curses.error:
+            pass
+
+    def seq(self, y, x, parts):
+        """parts: [(text, color)] in sequence."""
+        for text, col in parts:
+            self.put(y, x, text, self.c[col] if isinstance(col, str) else col)
+            x += len(str(text))
+        return x
+
+    def box(self, y, x, h, w, title, extra=""):
+        d = self.c["d"]
+        self.clip = self.W
+        self.put(y, x, "┌" + "─" * (w - 2) + "┐", d)
+        for i in range(1, h - 1):
+            self.put(y + i, x, "│", d)
+            self.put(y + i, x + w - 1, "│", d)
+        self.put(y + h - 1, x, "└" + "─" * (w - 2) + "┘", d)
+        self.put(y, x + 2, f" {title} ", self.c["y"] | curses.A_BOLD)
+        if extra:
+            self.put(y, x + 4 + len(title), f" {extra} "[:max(0, w - 6 - len(title))], d)
+        self.clip = min(self.W, x + w - 2)
+        return y + 1, x + 2, w - 4
+
+    def pc(self, v, lo=60, hi=85):
+        return "g" if v < lo else ("y" if v < hi else "r")
+
+    def bar(self, y, x, w, segs):
+        """segs: [(fraction 0..1, color)]"""
+        if w <= 0:
+            return
+        self.put(y, x, "░" * w, self.c["d"])
+        pos = 0
+        for frac, col in segs:
+            n = int(round(max(0.0, min(1.0, frac)) * w))
+            n = min(n, w - pos)
+            if n > 0:
+                self.put(y, x + pos, "█" * n, self.c[col])
+                pos += n
+
+    def spark(self, y, x, w, vals, col, top=None):
+        if w <= 0:
+            return
+        vals = list(vals)[-w:]
+        top = top or max(vals + [1e-9])
+        s = "".join(SPARK[min(7, int(7.999 * max(0, v) / top))] if top > 0 else SPARK[0] for v in vals)
+        self.put(y, x, " " * (w - len(s)) + s, self.c[col])
+
+    # -- view: single node
+    def draw_node(self, node, y):
+        s, W = node.snap, self.W
+        if not s:
+            self.put(y + 1, 2, f"{node.name}: {node.err or 'no data yet'}", self.c["r"])
+            return
+        for a in s["alerts"][:3]:
+            col = {"crit": "r", "warn": "y"}.get(a["level"], "c")
+            self.put(y, 1, "▲ " + a["msg"], self.c[col] | curses.A_BOLD)
+            y += 1
+        half = W // 2
+        cpu, mem, hist = s["cpu"], s["mem"], s["hist"]
+
+        # CPU
+        iy, ix, iw = self.box(y, 0, 6, half, "CPU", f"{len(cpu['cores'])} cores")
+        self.seq(iy, ix, [(fv(cpu["temp"], "{:.0f}", "°C"), self.pc(cpu["temp"] or 0, 70, 88)), ("  ", "n"),
+                          (fv(cpu["freq"] and cpu["freq"] / 1000, "{:.1f}", " GHz"), "n"),
+                          ("  load ", "d"), (" ".join(f"{l:.2f}" for l in cpu["load"]), "n"),
+                          ("  tasks ", "d"), (cpu["tasks"], "n")])
+        self.put(iy + 1, ix, "util", self.c["d"])
+        self.bar(iy + 1, ix + 5, iw - 13, [(cpu["util"] / 100, self.pc(cpu["util"]))])
+        self.put(iy + 1, ix + iw - 7, f"{cpu['util']:5.1f} %", self.c[self.pc(cpu["util"])])
+        self.put(iy + 2, ix, "core", self.c["d"])
+        for i, u in enumerate(cpu["cores"][:iw - 5]):
+            self.put(iy + 2, ix + 5 + i, SPARK[min(7, int(u / 12.5))], self.c[self.pc(u)])
+        cx = ix + 6 + len(cpu["cores"])
+        if cx + 30 < ix + iw:
+            self.seq(iy + 2, cx, [(" usr ", "d"), (f"{cpu['usr']:.1f}%", "n"), (" sys ", "d"),
+                                  (f"{cpu['sys']:.1f}%", "n"), (" io ", "d"), (f"{cpu['iowait']:.1f}%", "n")])
+        self.put(iy + 3, ix, "hist", self.c["d"])
+        self.spark(iy + 3, ix + 5, iw - 5, hist["cpu"], "g", 100)
+
+        # memory
+        title = "Memory · shared with GPU" if s["unified"] else "Memory"
+        iy, ix, iw = self.box(y, half, 6, W - half, title)
+        tot = max(1, mem["total"])
+        gpum = min(s["gpu_proc_mem"], mem["used"]) if s["unified"] else 0
+        upct = 100.0 * mem["used"] / tot
+        self.seq(iy, ix, [("RAM ", "d"), (f"{fb(mem['used'])} / {fb(mem['total'])}", "w"),
+                          ("  avail ", "d"), (fb(mem["avail"]), self.pc(upct, 80, 92)),
+                          ("  Swap ", "d"), (f"{fb(mem['swap_used'])} / {fb(mem['swap_total'])}", "n")])
+        pcol = {pid: "mycb"[i % 4] for i, pid in enumerate(sorted(p["pid"] for p in s["procs"]))}
+        segs = [(p["gpu_mem"] / tot, pcol[p["pid"]])
+                for p in sorted(s["procs"], key=lambda p: -p["gpu_mem"])] if s["unified"] else []
+        self.bar(iy + 1, ix, iw - 8, segs + [((mem["used"] - gpum) / tot, "g")])
+        self.put(iy + 1, ix + iw - 7, f"{upct:5.1f} %", self.c[self.pc(upct, 80, 92)])
+        parts = []
+        if s["unified"]:
+            parts += [("■", "m"), ("■ ", "y"), (f"GPU {fb(gpum)}  ", "n")]
+        parts += [("■ ", "g"), (f"system {fb(mem['used'] - gpum)}  ", "n"),
+                  ("Cache ", "d"), (fb(mem["cache"]), "n")]
+        if mem["psi"] is not None:
+            parts += [("  pressure ", "d"), (f"{mem['psi']:.1f}%", self.pc(mem["psi"], 5, 20))]
+        self.seq(iy + 2, ix, parts)
+        self.put(iy + 3, ix, "hist", self.c["d"])
+        self.spark(iy + 3, ix + 5, iw - 5, hist["mem"], "c", 100)
+        y += 6
+
+        # GPU
+        gpus = s["gpus"]
+        gh = 2 + max(1, 2 * len(gpus)) + 1
+        iy, ix, iw = self.box(y, 0, gh, W, "GPU", f"driver {s['driver']} · {s['gpu_src']}")
+        if not gpus:
+            self.put(iy, ix, "no NVIDIA GPU found " + s.get("gpu_error", ""), self.c["d"])
+        for i, g in enumerate(gpus):
+            r = iy + 2 * i
+            x = self.seq(r, ix, [(f"GPU {i} ", "c"), (g["name"], "w"), ("  ", "n"),
+                                 (fv(g["temp"], "{:.0f}", "°C"), self.pc(g["temp"] or 0, 75, 88)),
+                                 ("  ⚡ ", "y"), (fv(g["power"], "{:.1f}", " W"), "n"),
+                                 ("  ", "n"), (fv(g["clock"], "{:.0f}", " MHz"), "n")])
+            if g["mem_total"]:
+                self.seq(r, x, [("  VRAM ", "d"), (f"{fb(g['mem_used'])} / {fb(g['mem_total'])}", "n")])
+            else:
+                self.seq(r, x, [("  memory ", "d"), (fb(s["gpu_proc_mem"]), "m"), (" (sum of processes)", "d")])
+            u = g["util"] or 0
+            self.put(r + 1, ix, "util", self.c["d"])
+            self.bar(r + 1, ix + 5, iw - 13, [(u / 100, self.pc(u, 70, 95))])
+            self.put(r + 1, ix + iw - 7, fv(g["util"], "{:5.1f}", " %"), self.c[self.pc(u, 70, 95)])
+        r = iy + max(1, 2 * len(gpus))
+        hw = (iw - 14) // 2
+        self.put(r, ix, "util", self.c["d"])
+        self.spark(r, ix + 5, hw, hist["gpu"], "g", 100)
+        self.put(r, ix + 7 + hw, "watt", self.c["d"])
+        self.spark(r, ix + 12 + hw, hw, hist["power"], "y")
+        y += gh
+
+        # vLLM
+        vl = s["vllm"]
+        live = [v for v in vl if v["ok"]]
+        vh = 2 + (len(live) + 1 if live else 1)
+        iy, ix, iw = self.box(y, 0, vh, W, "vLLM")
+        if not live:
+            self.put(iy, ix, "no vLLM reachable (" + ", ".join(
+                urlparse(v["url"]).netloc for v in vl) + ") - panel fills in once /metrics responds", self.c["d"])
+        for i, v in enumerate(live):
+            model = ", ".join(v["models"]) or "?"
+            if len(model) > 34:
+                model = "…" + model[-33:]
+            self.seq(iy + i, ix, [
+                ("● ", "g"), (f":{urlparse(v['url']).port} ", "c"), (f"{model:<34} ", "w"),
+                ("running ", "d"), (f"{v['running']:<3.0f}", "n"),
+                ("waiting ", "d"), (f"{v['waiting']:<3.0f}", "y" if v["waiting"] else "n"),
+                ("gen ", "d"), (f"{v['gen_tps']:7.1f} tok/s  ", "g"),
+                ("prompt ", "d"), (f"{v['prompt_tps']:7.1f} tok/s  ", "n"),
+                ("TTFT ", "d"), (fv(v["ttft"] and v["ttft"] * 1000, "{:.0f}", " ms") + "  ", "n"),
+                ("E2E ", "d"), (fv(v["e2e"], "{:.1f}", " s") + "  ", "n"),
+                ("KV-Cache ", "d"), (fv(v["kv"], "{:.0f}", " %"), self.pc(v["kv"] or 0, 70, 90))])
+        if live:
+            top = max(hist["tps"][-(iw - 22):] + [1])
+            self.put(iy + len(live), ix, "tok/s", self.c["d"])
+            self.spark(iy + len(live), ix + 6, iw - 22, hist["tps"], "g")
+            self.put(iy + len(live), ix + iw - 14, f"max {top:.0f}", self.c["d"])
+        y += vh
+
+        # disk + network
+        disks, fs, nets = s["disks"], s["fs"], s["net"]
+        rows = max(1, min(4, max(len(disks) + len(fs), len(nets))))
+        dh = rows + 3
+        iy, ix, iw = self.box(y, 0, dh, half, "Disk")
+        self.put(iy, ix, f"{'Device':<14}{'used':>18}{'Read':>13}{'Write':>13}", self.c["d"])
+        r = iy + 1
+        for f in fs[:rows]:
+            p = 100.0 * f["used"] / f["total"]
+            self.seq(r, ix, [(f"{f['mount'][:13]:<14}", "n"),
+                             (f"{fb(f['used']):>9}/{fb(f['total']):<8}", "n"), (f"{p:3.0f}%", self.pc(p, 80, 92))])
+            r += 1
+        for d in disks[:max(0, rows - len(fs[:rows]))]:
+            self.seq(r, ix, [(f"{d['dev'][:13]:<14}", "c"), (" " * 18, "n"),
+                             (f"{fr(d['read']):>13}", "g"), (f"{fr(d['write']):>13}", "y")])
+            r += 1
+        iy, ix, iw = self.box(y, half, dh, W - half, "Network")
+        self.put(iy, ix, f"{'Interface':<18}{'Link':>10}{'RX':>13}{'TX':>13}{'Errors':>8}", self.c["d"])
+        for i, n in enumerate(nets[:rows]):
+            up = n["state"] == "up"
+            link = (f"{n['speed'] / 1000:g} Gb" if n["speed"] and n["speed"] >= 1000
+                    else f"{n['speed']} Mb" if n["speed"] else n["state"])
+            self.seq(iy + 1 + i, ix, [("● " if up else "○ ", "g" if up else "d"),
+                                      (f"{n['if'][:15]:<16}", "n" if up else "d"), (f"{link:>10}", "n" if up else "d"),
+                                      (f"{fr(n['rx']):>13}", "g" if up else "d"), (f"{fr(n['tx']):>13}", "m" if up else "d"),
+                                      (f"{n['err'] + n['drop']:>8}", "r" if n["err"] + n["drop"] else "d")])
+        y += dh
+
+        # processes
+        keys = [("GPU memory", "gpu_mem"), ("CPU", "cpu"), ("RAM", "rss")]
+        procs = sorted(s["procs"], key=lambda p: -p[keys[self.sort][1]])
+        ph = max(4, self.H - y - 1)
+        iy, ix, iw = self.box(y, 0, ph, W, "GPU processes", f"{len(procs)} · sorted by {keys[self.sort][0]}")
+        self.put(iy, ix, f"{'PID':>8} {'USER':<10}{'TYPE':<4}{'CPU%':>7}{'GPU-MEM':>10}{'RAM':>10}  NAME", self.c["d"])
+        if not procs:
+            self.put(iy + 1, ix, "no processes on the GPU", self.c["d"])
+        self.cur_procs = procs if node is self.nodes[0] else []
+        self.psel = max(0, min(self.psel, len(procs) - 1))
+        for i, p in enumerate(procs[:ph - 3]):
+            x = self.seq(iy + 1 + i, ix, [
+                (f"{p['pid']:>8} ", curses.A_REVERSE if i == self.psel else "n"), (f"{p['user'][:9]:<10}", "n"),
+                (f"{p['type']:<4}", "m" if p["type"] == "C" else "d"),
+                (f"{p['cpu']:>6.1f}%", self.pc(p["cpu"], 150, 600)),
+                (f"{fb(p['gpu_mem']):>10}", "m"), (f"{fb(p['rss']):>10}", "n"), ("  ", "n"), ("■ ", pcol[p["pid"]])])
+            if p["container"]:
+                x = self.seq(iy + 1 + i, x, [("[" + p["container"][:28] + "] ", "c")])
+            self.put(iy + 1 + i, x, p["name"][:max(0, ix + iw - x)])
+
+    # -- view: mesh
+    def draw_mesh(self, y):
+        W = self.W
+        iy, ix, iw = self.box(y, 0, len(self.nodes) + 5, W, "Mesh", f"{len(self.nodes)} nodes")
+        self.put(iy, ix, f"  {'Node':<26}{'Latency':>8}{'CPU':>7}{'RAM':>20}{'GPU':>7}{'Temp':>7}"
+                         f"{'Power':>8}{'tok/s':>9}{'run/wait':>12}{'Net RX/TX':>24}  Alerts", self.c["d"])
+        tot = collections.Counter()
+        for i, n in enumerate(self.nodes):
+            r, s = iy + 1 + i, n.snap
+            selattr = curses.A_REVERSE if i == self.sel else 0
+            stale = not n.ok or not s
+            self.put(r, ix, ("● " if not stale else "○ "), self.c["g" if not stale else "r"])
+            self.put(r, ix + 2, f"{n.name[:25]:<26}", selattr | curses.A_BOLD)
+            if not s:
+                self.put(r, ix + 29, n.err or "no data", self.c["r"])
+                continue
+            gp = s["gpus"]
+            util = [g["util"] for g in gp if g["util"] is not None]
+            gu = sum(util) / len(util) if util else None
+            temp = max([g["temp"] for g in gp if g["temp"] is not None], default=None)
+            watt = sum(g["power"] or 0 for g in gp)
+            live = [v for v in s["vllm"] if v["ok"]]
+            tps = sum(v["gen_tps"] for v in live)
+            run, wait = sum(v["running"] for v in live), sum(v["waiting"] for v in live)
+            rx, tx = sum(x["rx"] for x in s["net"]), sum(x["tx"] for x in s["net"])
+            m = s["mem"]
+            mp = 100.0 * m["used"] / max(1, m["total"])
+            col = (lambda c: "d") if stale else (lambda c: c)
+            self.seq(r, ix + 28, [
+                (f"{fv(n.lat, '{:.0f}', ' ms'):>8}", col("n")),
+                (f"{s['cpu']['util']:>6.0f}%", col(self.pc(s["cpu"]["util"]))),
+                (f"{fb(m['used']) + ' / ' + fb(m['total']):>20}", col(self.pc(mp, 80, 92))),
+                (f"{fv(gu, '{:.0f}', '%'):>7}", col(self.pc(gu or 0, 70, 95))),
+                (f"{fv(temp, '{:.0f}', '°C'):>7}", col(self.pc(temp or 0, 75, 88))),
+                (f"{watt:>6.1f} W", col("y")),
+                (f"{tps:>9.1f}", col("g")),
+                (f"{run:>7.0f}/{wait:<4.0f}", col("y" if wait else "n")),
+                (f"{fr(rx) + ' / ' + fr(tx):>24}", col("n")), ("  ", "n"),
+                (str(len(s["alerts"])) if s["alerts"] else "-", col("r" if s["alerts"] else "d")),
+                (f"  {n.err}" if stale else "", "r")])
+            if not stale:
+                tot.update(watt=watt, tps=tps, run=run, wait=wait, used=m["used"], total=m["total"],
+                           gmem=s["gpu_proc_mem"], n=1)
+        r = iy + 1 + len(self.nodes)
+        self.put(r, ix, "─" * iw, self.c["d"])
+        self.seq(r + 1, ix + 2, [(f"Total ({tot['n']} online)  ", "w"),
+                                 ("RAM ", "d"), (f"{fb(tot['used'])} / {fb(tot['total'])}  ", "n"),
+                                 ("GPU processes ", "d"), (f"{fb(tot['gmem'])}  ", "m"),
+                                 ("Power ", "d"), (f"{tot['watt']:.1f} W  ", "y"),
+                                 ("vLLM ", "d"), (f"{tot['tps']:.1f} tok/s  ", "g"),
+                                 ("running/waiting ", "d"), (f"{tot['run']:.0f}/{tot['wait']:.0f}", "n")])
+        y += len(self.nodes) + 5
+        # history per node
+        iy, ix, iw = self.box(y, 0, len(self.nodes) + 2, W, "History", "GPU utilization · tok/s")
+        hw = (iw - 40) // 2
+        for i, n in enumerate(self.nodes):
+            self.put(iy + i, ix, f"{n.name[:25]:<26}")
+            if n.snap:
+                self.put(iy + i, ix + 27, "GPU", self.c["d"])
+                self.spark(iy + i, ix + 31, hw, n.snap["hist"]["gpu"], "g", 100)
+                self.put(iy + i, ix + 33 + hw, "tok/s", self.c["d"])
+                self.spark(iy + i, ix + 39 + hw, hw, n.snap["hist"]["tps"], "m")
+        y += len(self.nodes) + 2
+        # alerts of all nodes
+        al = [(n.name, a) for n in self.nodes if n.snap and n.ok for a in n.snap["alerts"]]
+        al += [(n.name, {"level": "crit", "msg": "unreachable: " + n.err}) for n in self.nodes if not n.ok]
+        if al and y + 3 < self.H:
+            iy, ix, iw = self.box(y, 0, min(len(al), self.H - y - 3) + 2, W, "Alerts")
+            for i, (name, a) in enumerate(al[:self.H - y - 3]):
+                col = {"crit": "r", "warn": "y"}.get(a["level"], "c")
+                self.seq(iy + i, ix, [("▲ ", col), (f"{name[:25]:<26}", "w"), (a["msg"], col)])
+
+    def draw_help(self):
+        lines = ["gbtop " + VERSION, "",
+                 "1 / 2 / Tab node view <-> mesh view",
+                 "j k / ↑ ↓   mesh: select node, Enter opens it · node: select process",
+                 "K           terminate selected process (SIGTERM, asks first, local only)",
+                 "s           cycle process sort order (GPU memory, CPU, RAM)",
+                 "+ / -       sampling interval of the local collector",
+                 "? / h       this help              q      quit", "",
+                 "Mesh is agentless: gbtop --nodes hostA,user@hostB  (key-based SSH and",
+                 "python3 on the nodes) or list the nodes in ~/.config/gbtop/nodes."]
+        w = max(len(l) for l in lines) + 6
+        y0, x0 = max(1, (self.H - len(lines) - 2) // 2), max(0, (self.W - w) // 2)
+        self.clip = self.W
+        for i in range(len(lines) + 2):
+            self.put(y0 + i, x0, " " * w)
+        iy, ix, _ = self.box(y0, x0, len(lines) + 2, w, "Help")
+        for i, l in enumerate(lines):
+            self.put(iy + i, ix + 1, l)
+
+    def draw(self):
+        self.H, self.W = self.scr.getmaxyx()
+        self.clip = self.W
+        self.scr.erase()
+        node = self.nodes[self.sel]
+        s = node.snap
+        x = self.seq(0, 0, [(" gbtop ", curses.A_REVERSE | curses.A_BOLD), (" ", "n")])
+        for key, name, v in (("1", "Node", "node"), ("2", "Mesh", "mesh")):
+            x = self.seq(0, x, [(f" {key} {name} ", curses.A_REVERSE if self.view == v else self.c["d"])])
+        right = time.strftime("%H:%M:%S")
+        if s and self.view == "node":
+            right = f"{node.name} · {s['kernel']} · up {fup(s['uptime'])} · {right}"
+        self.put(0, max(x + 1, self.W - len(right) - 1), right, self.c["c"])
+        top = 1
+        if self.W < 110 or self.H < 24:
+            self.put(1, 1, f"small terminal ({self.W}x{self.H}) - 130x40 or larger recommended", self.c["y"])
+            top = 2
+        if self.view == "mesh":
+            self.draw_mesh(top)
+        else:
+            self.draw_node(node, top)
+        self.clip = self.W
+        foot = f" q quit · 1/2/Tab view · j/k select · s sort · K terminate · +/- interval {self.col.interval:g} s · ? help "
+        room = self.W - len(SIGNATURE) - 3           # the signature always stays visible
+        self.put(self.H - 1, 0, " " * (self.W - 1))
+        self.put(self.H - 1, 0, foot[:max(0, room)], self.c["d"])
+        if self.msg:
+            self.put(self.H - 1, max(0, min(len(foot), room - len(self.msg) - 2)), " " + self.msg + " ", self.c["y"])
+        self.put(self.H - 1, max(0, self.W - len(SIGNATURE) - 2), SIGNATURE, self.c["c"])
+        if self.help:
+            self.draw_help()
+        self.scr.refresh()
+
+    def kill(self):
+        if not self.cur_procs:
+            self.msg = "only processes of the local node can be terminated"
+            return
+        p = self.cur_procs[min(self.psel, len(self.cur_procs) - 1)]
+        self.put(self.H - 1, 0, f" send SIGTERM to PID {p['pid']} ({p['name'][:40]})? y/n ".ljust(self.W - 1),
+                 self.c["r"] | curses.A_REVERSE)
+        self.scr.refresh()
+        self.scr.timeout(-1)
+        k = self.scr.getch()
+        self.scr.timeout(250)
+        if k == ord("y"):
+            try:
+                os.kill(p["pid"], signal.SIGTERM)
+                self.msg = f"SIGTERM sent to PID {p['pid']}"
+            except OSError as ex:
+                self.msg = f"PID {p['pid']}: {ex.strerror}"
+
+    def loop(self):
+        while True:
+            self.draw()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            if self.help:
+                self.help = False
+                continue
+            if k in (ord("q"), 27):
+                return
+            if k in (ord("?"), ord("h")):
+                self.help = True
+            elif k == ord("1"):
+                self.view = "node"
+            elif k == ord("2"):
+                self.view = "mesh"
+            elif k == 9:
+                self.view = "mesh" if self.view == "node" else "node"
+            elif k in (ord("j"), curses.KEY_DOWN):
+                if self.view == "mesh":
+                    self.sel = (self.sel + 1) % len(self.nodes)
+                else:
+                    self.psel += 1
+            elif k in (ord("k"), curses.KEY_UP):
+                if self.view == "mesh":
+                    self.sel = (self.sel - 1) % len(self.nodes)
+                else:
+                    self.psel = max(0, self.psel - 1)
+            elif k == ord("K") and self.view == "node":
+                self.kill()
+            elif k in (10, 13, curses.KEY_ENTER):
+                self.view = "node"
+            elif k == ord("s"):
+                self.sort = (self.sort + 1) % 3
+            elif k in (ord("+"), ord("=")):
+                self.col.interval = min(10.0, self.col.interval + 0.5)
+            elif k == ord("-"):
+                self.col.interval = max(0.5, self.col.interval - 0.5)
+
+
+# ───────────────────────────── Start ──────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(prog="gbtop", epilog=SIGNATURE, description="gbtop - monitor for GB10 / DGX Spark with vLLM and mesh")
+    ap.add_argument("-i", "--interval", type=float, default=2.0, help="sampling interval in seconds (default 2)")
+    ap.add_argument("--vllm", default="http://127.0.0.1:8000",
+                    help="vLLM base URLs, comma separated (default http://127.0.0.1:8000)")
+    ap.add_argument("--nodes", default="",
+                    help="mesh nodes, comma separated: SSH targets (host, user@host, ssh-config alias); "
+                         "http://host:port for a node running --serve")
+    ap.add_argument("--emit", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--token", default=os.environ.get("GBTOP_TOKEN"), help="token for --serve and for http:// nodes")
+    ap.add_argument("--serve", action="store_true", help="run headless: HTTP endpoint with /api/snapshot and Prometheus /metrics")
+    ap.add_argument("--bind", default="127.0.0.1", help="bind address for --serve (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--no-nvml", action="store_true", help="use nvidia-smi instead of the NVML library")
+    ap.add_argument("--once", action="store_true", help="print one snapshot as JSON")
+    ap.add_argument("--version", action="version", version=VERSION)
+    a = ap.parse_args()
+
+    col = Collector(max(0.5, a.interval), [u.strip() for u in a.vllm.split(",") if u.strip()],
+                    use_nvml=not a.no_nvml, persist=not a.once)
+    if a.emit:                                   # remote side of an SSH mesh connection
+        col.persist = False
+        col.sample()
+        time.sleep(0.5)
+        try:
+            while True:
+                t0 = time.time()
+                sys.stdout.write(json.dumps(col.sample()) + "\n")
+                sys.stdout.flush()
+                time.sleep(max(0.2, col.interval - (time.time() - t0)))
+        except (OSError, KeyboardInterrupt):
+            os._exit(0)                              # viewer went away
+    if a.once:
+        col.sample()
+        time.sleep(1.0)
+        s = col.sample()
+        s.pop("hist")
+        print(json.dumps(s, indent=1, ensure_ascii=False))
+        return
+    threading.Thread(target=col.run, daemon=True).start()
+
+    if a.serve:
+        srv = serve(col, a.bind, a.port, a.token)
+        print(f"gbtop agent {VERSION} on http://{a.bind}:{a.port}  (GPU source: {col.gpu_src}"
+              f"{', token enabled' if a.token else ', no token'})", flush=True)
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        col.save_hist()
+        return
+
+    specs = [n.strip() for n in a.nodes.split(",") if n.strip()]
+    for line in (read(NODES_FILE) or "").splitlines():
+        line = line.split("#")[0].strip()
+        if line:
+            specs.append(line)
+    stop = col.stop
+    nodes = [Local(col)]
+    for sp in specs:
+        if sp.startswith(("http://", "https://")):   # optional: node running "gbtop --serve"
+            if a.token and len(sp.split()) == 1:
+                sp += " " + a.token
+            nodes.append(Remote(sp, max(1.0, a.interval), stop))
+        else:
+            extra = "--vllm " + shlex.quote(a.vllm) + (" --no-nvml" if a.no_nvml else "")
+            nodes.append(SSHNode(sp, max(1.0, a.interval), stop, extra))
+    locale.setlocale(locale.LC_ALL, "")
+    while col.snap is None:
+        time.sleep(0.05)
+    try:
+        curses.wrapper(lambda scr: UI(scr, nodes, col, a.interval).loop())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for n in nodes:
+            if hasattr(n, "close"):
+                n.close()
+        col.save_hist()
+
+
+if __name__ == "__main__":
+    main()
