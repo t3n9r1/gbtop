@@ -17,7 +17,7 @@ import urllib.request, xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SIGNATURE = "irgNET - Hakki Cemre Guenay / https://irg-net.com"
 DEFAULT_PORT = 9755
 HIST_LEN = 300
@@ -796,15 +796,30 @@ class UI:
         self.help = False
         self.psel, self.cur_procs, self.msg = 0, [], ""
         curses.curs_set(0)
-        curses.use_default_colors()
+        # NVIDIA theme: green #76B900 as the primary color on dark gray #1E1E1E,
+        # white and grays for text, amber and red only for warnings.
         self.c = {}
-        dim = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-        for i, (name, col_) in enumerate((("g", curses.COLOR_GREEN), ("y", curses.COLOR_YELLOW),
-                                          ("r", curses.COLOR_RED), ("c", curses.COLOR_CYAN),
-                                          ("m", curses.COLOR_MAGENTA), ("b", curses.COLOR_BLUE),
-                                          ("d", dim)), 1):
-            curses.init_pair(i, col_, -1)
+        if curses.COLORS >= 256:
+            try:
+                if curses.can_change_color():
+                    curses.init_color(106, 463, 725, 0)      # exact #76B900
+            except curses.error:
+                pass
+            bg, black = 234, 16                              # 234 = #1C1C1C
+            table = {"g": 106, "m": 150, "b": 64, "c": 255, "y": 214, "r": 203, "d": 245, "x": 240}
+            curses.init_pair(20, 252, bg)
+            scr.bkgd(" ", curses.color_pair(20))
+        else:
+            curses.use_default_colors()
+            bg, black = -1, curses.COLOR_BLACK
+            table = {"g": curses.COLOR_GREEN, "m": curses.COLOR_GREEN, "b": curses.COLOR_GREEN,
+                     "c": curses.COLOR_WHITE, "y": curses.COLOR_YELLOW, "r": curses.COLOR_RED,
+                     "d": curses.COLOR_WHITE, "x": curses.COLOR_WHITE}
+        for i, (name, fg) in enumerate(table.items(), 1):
+            curses.init_pair(i, fg, bg)
             self.c[name] = curses.color_pair(i)
+        curses.init_pair(21, black, table["g"])
+        self.c["hd"] = curses.color_pair(21) | curses.A_BOLD   # header, tabs, selection
         self.c["w"] = curses.A_BOLD
         self.c["n"] = 0
         scr.timeout(250)
@@ -826,16 +841,16 @@ class UI:
         return x
 
     def box(self, y, x, h, w, title, extra=""):
-        d = self.c["d"]
+        d = self.c["x"]
         self.clip = self.W
         self.put(y, x, "┌" + "─" * (w - 2) + "┐", d)
         for i in range(1, h - 1):
             self.put(y + i, x, "│", d)
             self.put(y + i, x + w - 1, "│", d)
         self.put(y + h - 1, x, "└" + "─" * (w - 2) + "┘", d)
-        self.put(y, x + 2, f" {title} ", self.c["y"] | curses.A_BOLD)
+        self.put(y, x + 2, f" {title} ", self.c["g"] | curses.A_BOLD)
         if extra:
-            self.put(y, x + 4 + len(title), f" {extra} "[:max(0, w - 6 - len(title))], d)
+            self.put(y, x + 4 + len(title), f" {extra} "[:max(0, w - 6 - len(title))], self.c["d"])
         self.clip = min(self.W, x + w - 2)
         return y + 1, x + 2, w - 4
 
@@ -846,7 +861,7 @@ class UI:
         """segs: [(fraction 0..1, color)]"""
         if w <= 0:
             return
-        self.put(y, x, "░" * w, self.c["d"])
+        self.put(y, x, "░" * w, self.c["x"])
         pos = 0
         for frac, col in segs:
             n = int(round(max(0.0, min(1.0, frac)) * w))
@@ -904,21 +919,22 @@ class UI:
         self.seq(iy, ix, [("RAM ", "d"), (f"{fb(mem['used'])} / {fb(mem['total'])}", "w"),
                           ("  avail ", "d"), (fb(mem["avail"]), self.pc(upct, 80, 92)),
                           ("  Swap ", "d"), (f"{fb(mem['swap_used'])} / {fb(mem['swap_total'])}", "n")])
-        pcol = {pid: "mycb"[i % 4] for i, pid in enumerate(sorted(p["pid"] for p in s["procs"]))}
+        syscol = "d" if s["unified"] else "g"
+        pcol = {pid: "gmbc"[i % 4] for i, pid in enumerate(sorted(p["pid"] for p in s["procs"]))}
         segs = [(p["gpu_mem"] / tot, pcol[p["pid"]])
                 for p in sorted(s["procs"], key=lambda p: -p["gpu_mem"])] if s["unified"] else []
-        self.bar(iy + 1, ix, iw - 8, segs + [((mem["used"] - gpum) / tot, "g")])
+        self.bar(iy + 1, ix, iw - 8, segs + [((mem["used"] - gpum) / tot, syscol)])
         self.put(iy + 1, ix + iw - 7, f"{upct:5.1f} %", self.c[self.pc(upct, 80, 92)])
         parts = []
         if s["unified"]:
-            parts += [("■", "m"), ("■ ", "y"), (f"GPU {fb(gpum)}  ", "n")]
-        parts += [("■ ", "g"), (f"system {fb(mem['used'] - gpum)}  ", "n"),
+            parts += [("■", "g"), ("■ ", "m"), (f"GPU {fb(gpum)}  ", "n")]
+        parts += [("■ ", syscol), (f"system {fb(mem['used'] - gpum)}  ", "n"),
                   ("Cache ", "d"), (fb(mem["cache"]), "n")]
         if mem["psi"] is not None:
             parts += [("  pressure ", "d"), (f"{mem['psi']:.1f}%", self.pc(mem["psi"], 5, 20))]
         self.seq(iy + 2, ix, parts)
         self.put(iy + 3, ix, "hist", self.c["d"])
-        self.spark(iy + 3, ix + 5, iw - 5, hist["mem"], "c", 100)
+        self.spark(iy + 3, ix + 5, iw - 5, hist["mem"], "m", 100)
         y += 6
 
         # GPU
@@ -931,22 +947,22 @@ class UI:
             r = iy + 2 * i
             x = self.seq(r, ix, [(f"GPU {i} ", "c"), (g["name"], "w"), ("  ", "n"),
                                  (fv(g["temp"], "{:.0f}", "°C"), self.pc(g["temp"] or 0, 75, 88)),
-                                 ("  ⚡ ", "y"), (fv(g["power"], "{:.1f}", " W"), "n"),
+                                 ("  ⚡ ", "g"), (fv(g["power"], "{:.1f}", " W"), "n"),
                                  ("  ", "n"), (fv(g["clock"], "{:.0f}", " MHz"), "n")])
             if g["mem_total"]:
                 self.seq(r, x, [("  VRAM ", "d"), (f"{fb(g['mem_used'])} / {fb(g['mem_total'])}", "n")])
             else:
-                self.seq(r, x, [("  memory ", "d"), (fb(s["gpu_proc_mem"]), "m"), (" (sum of processes)", "d")])
+                self.seq(r, x, [("  memory ", "d"), (fb(s["gpu_proc_mem"]), "g"), (" (sum of processes)", "d")])
             u = g["util"] or 0
             self.put(r + 1, ix, "util", self.c["d"])
-            self.bar(r + 1, ix + 5, iw - 13, [(u / 100, self.pc(u, 70, 95))])
-            self.put(r + 1, ix + iw - 7, fv(g["util"], "{:5.1f}", " %"), self.c[self.pc(u, 70, 95)])
+            self.bar(r + 1, ix + 5, iw - 13, [(u / 100, "g")])
+            self.put(r + 1, ix + iw - 7, fv(g["util"], "{:5.1f}", " %"), self.c["g"])
         r = iy + max(1, 2 * len(gpus))
         hw = (iw - 14) // 2
         self.put(r, ix, "util", self.c["d"])
         self.spark(r, ix + 5, hw, hist["gpu"], "g", 100)
         self.put(r, ix + 7 + hw, "watt", self.c["d"])
-        self.spark(r, ix + 12 + hw, hw, hist["power"], "y")
+        self.spark(r, ix + 12 + hw, hw, hist["power"], "m")
         y += gh
 
         # vLLM
@@ -991,7 +1007,7 @@ class UI:
             r += 1
         for d in disks[:max(0, rows - len(fs[:rows]))]:
             self.seq(r, ix, [(f"{d['dev'][:13]:<14}", "c"), (" " * 18, "n"),
-                             (f"{fr(d['read']):>13}", "g"), (f"{fr(d['write']):>13}", "y")])
+                             (f"{fr(d['read']):>13}", "g"), (f"{fr(d['write']):>13}", "m")])
             r += 1
         iy, ix, iw = self.box(y, half, dh, W - half, "Network")
         self.put(iy, ix, f"{'Interface':<18}{'Link':>10}{'RX':>13}{'TX':>13}{'Errors':>8}", self.c["d"])
@@ -1017,10 +1033,10 @@ class UI:
         self.psel = max(0, min(self.psel, len(procs) - 1))
         for i, p in enumerate(procs[:ph - 3]):
             x = self.seq(iy + 1 + i, ix, [
-                (f"{p['pid']:>8} ", curses.A_REVERSE if i == self.psel else "n"), (f"{p['user'][:9]:<10}", "n"),
-                (f"{p['type']:<4}", "m" if p["type"] == "C" else "d"),
+                (f"{p['pid']:>8} ", self.c["hd"] if i == self.psel else "n"), (f"{p['user'][:9]:<10}", "n"),
+                (f"{p['type']:<4}", "g" if p["type"] == "C" else "d"),
                 (f"{p['cpu']:>6.1f}%", self.pc(p["cpu"], 150, 600)),
-                (f"{fb(p['gpu_mem']):>10}", "m"), (f"{fb(p['rss']):>10}", "n"), ("  ", "n"), ("■ ", pcol[p["pid"]])])
+                (f"{fb(p['gpu_mem']):>10}", "g"), (f"{fb(p['rss']):>10}", "n"), ("  ", "n"), ("■ ", pcol[p["pid"]])])
             if p["container"]:
                 x = self.seq(iy + 1 + i, x, [("[" + p["container"][:28] + "] ", "c")])
             self.put(iy + 1 + i, x, p["name"][:max(0, ix + iw - x)])
@@ -1034,10 +1050,10 @@ class UI:
         tot = collections.Counter()
         for i, n in enumerate(self.nodes):
             r, s = iy + 1 + i, n.snap
-            selattr = curses.A_REVERSE if i == self.sel else 0
+            selattr = self.c["hd"] if i == self.sel else curses.A_BOLD
             stale = not n.ok or not s
             self.put(r, ix, ("● " if not stale else "○ "), self.c["g" if not stale else "r"])
-            self.put(r, ix + 2, f"{n.name[:25]:<26}", selattr | curses.A_BOLD)
+            self.put(r, ix + 2, f"{n.name[:25]:<26}", selattr)
             if not s:
                 self.put(r, ix + 29, n.err or "no data", self.c["r"])
                 continue
@@ -1057,9 +1073,9 @@ class UI:
                 (f"{fv(n.lat, '{:.0f}', ' ms'):>8}", col("n")),
                 (f"{s['cpu']['util']:>6.0f}%", col(self.pc(s["cpu"]["util"]))),
                 (f"{fb(m['used']) + ' / ' + fb(m['total']):>20}", col(self.pc(mp, 80, 92))),
-                (f"{fv(gu, '{:.0f}', '%'):>7}", col(self.pc(gu or 0, 70, 95))),
+                (f"{fv(gu, '{:.0f}', '%'):>7}", col("g")),
                 (f"{fv(temp, '{:.0f}', '°C'):>7}", col(self.pc(temp or 0, 75, 88))),
-                (f"{watt:>6.1f} W", col("y")),
+                (f"{watt:>6.1f} W", col("n")),
                 (f"{tps:>9.1f}", col("g")),
                 (f"{run:>7.0f}/{wait:<4.0f}", col("y" if wait else "n")),
                 (f"{fr(rx) + ' / ' + fr(tx):>24}", col("n")), ("  ", "n"),
@@ -1072,8 +1088,8 @@ class UI:
         self.put(r, ix, "─" * iw, self.c["d"])
         self.seq(r + 1, ix + 2, [(f"Total ({tot['n']} online)  ", "w"),
                                  ("RAM ", "d"), (f"{fb(tot['used'])} / {fb(tot['total'])}  ", "n"),
-                                 ("GPU processes ", "d"), (f"{fb(tot['gmem'])}  ", "m"),
-                                 ("Power ", "d"), (f"{tot['watt']:.1f} W  ", "y"),
+                                 ("GPU processes ", "d"), (f"{fb(tot['gmem'])}  ", "g"),
+                                 ("Power ", "d"), (f"{tot['watt']:.1f} W  ", "n"),
                                  ("vLLM ", "d"), (f"{tot['tps']:.1f} tok/s  ", "g"),
                                  ("running/waiting ", "d"), (f"{tot['run']:.0f}/{tot['wait']:.0f}", "n")])
         y += len(self.nodes) + 5
@@ -1122,9 +1138,9 @@ class UI:
         self.scr.erase()
         node = self.nodes[self.sel]
         s = node.snap
-        x = self.seq(0, 0, [(" gbtop ", curses.A_REVERSE | curses.A_BOLD), (" ", "n")])
+        x = self.seq(0, 0, [(" gbtop ", self.c["hd"]), (" ", "n")])
         for key, name, v in (("1", "Node", "node"), ("2", "Mesh", "mesh")):
-            x = self.seq(0, x, [(f" {key} {name} ", curses.A_REVERSE if self.view == v else self.c["d"])])
+            x = self.seq(0, x, [(f" {key} {name} ", self.c["hd"] if self.view == v else self.c["d"])])
         right = time.strftime("%H:%M:%S")
         if s and self.view == "node":
             right = f"{node.name} · {s['kernel']} · up {fup(s['uptime'])} · {right}"
@@ -1144,7 +1160,7 @@ class UI:
         self.put(self.H - 1, 0, foot[:max(0, room)], self.c["d"])
         if self.msg:
             self.put(self.H - 1, max(0, min(len(foot), room - len(self.msg) - 2)), " " + self.msg + " ", self.c["y"])
-        self.put(self.H - 1, max(0, self.W - len(SIGNATURE) - 2), SIGNATURE, self.c["c"])
+        self.put(self.H - 1, max(0, self.W - len(SIGNATURE) - 2), SIGNATURE, self.c["g"])
         if self.help:
             self.draw_help()
         self.scr.refresh()
