@@ -2,6 +2,8 @@
 
 Terminal monitor for NVIDIA GB10 machines (DGX Spark, Dell Pro Max GB10) with vLLM metrics and an agentless mesh view. A single file, Python standard library only.
 
+![gbtop node view on a Dell Pro Max GB10 running vLLM](docs/screenshot.png)
+
 ## Install
 
 ```bash
