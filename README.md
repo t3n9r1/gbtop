@@ -31,7 +31,7 @@ Press `?` inside gbtop for the keys.
 
 ## What it shows
 
-Every color has one job on the dark gray background: Green for the GPU, Papaya for vLLM tokens per second, and Blue for CPU and memory. Normal values are White; Yellow and Red appear only for warnings.
+Every color has one Job: Green for the GPU, Papaya for vLLM tokens per second, and Blue for CPU and memory. Normal values are White; Yellow and Red appear only for warnings.
 
 - **Node view:** per-core CPU, unified memory with each GPU process in its own color, GPU temperature, power, clock and utilization, disk, network, and the GPU processes with their Docker container names.
 - **vLLM panel:** generated and prompt tokens per second, running and waiting requests, time to first token, end-to-end latency and KV cache usage. gbtop probes port 8000 and every port it finds on the command line of a running vLLM process; use `--vllm http://host:port` for anything else.
