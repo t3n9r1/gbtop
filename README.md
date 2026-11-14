@@ -31,7 +31,7 @@ Press `?` inside gbtop for the keys.
 
 ## What it shows
 
-The interface uses NVIDIA green (#76B900) on dark gray; amber and red are reserved for warnings.
+Every color has one job on the dark gray background: NVIDIA green (#76B900) for the GPU, McLaren papaya (#FF8000) for vLLM tokens per second, steel blue for the CPU and violet for memory. Normal values are white; yellow and red appear only for warnings.
 
 - **Node view:** per-core CPU, unified memory with each GPU process in its own color, GPU temperature, power, clock and utilization, disk, network, and the GPU processes with their Docker container names.
 - **vLLM panel:** generated and prompt tokens per second, running and waiting requests, time to first token, end-to-end latency and KV cache usage. gbtop probes port 8000 and every port it finds on the command line of a running vLLM process; use `--vllm http://host:port` for anything else.
