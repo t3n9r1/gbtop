@@ -17,7 +17,7 @@ import urllib.request, xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SIGNATURE = "irgNET - Hakki Cemre Guenay / https://irg-net.com"
 DEFAULT_PORT = 9755
 HIST_LEN = 300
@@ -191,6 +191,7 @@ class Collector:
             except Exception:
                 self.nvml = None
         self.prev = {}
+        self.neterr = {}
         self.pcpu = {}
         self.vprev = {}
         self.docker = ({}, 0.0)
@@ -358,6 +359,10 @@ class Collector:
                         "rx": self._rate("nr" + name, int(p[0]), now),
                         "tx": self._rate("nt" + name, int(p[8]), now),
                         "err": int(p[2]) + int(p[10]), "drop": int(p[3]) + int(p[11])})
+            bad = out[-1]["err"] + out[-1]["drop"]   # counters since boot; flag only fresh increases
+            old = self.neterr.get(name)
+            self.neterr[name] = (bad, now if old and bad > old[0] else (old[1] if old else 0.0))
+            out[-1]["err_new"] = now - self.neterr[name][1] < 60
         out.sort(key=lambda n: (n["state"] != "up", n["if"]))
         return out
 
@@ -381,6 +386,8 @@ class Collector:
     def _pretty(argv):
         if not argv:
             return "?"
+        if " --" in argv[0]:                         # Chrome/Electron rewrite argv into one string
+            argv = argv[0].split() + argv[1:]
         joined = " ".join(argv)
         if "vllm" in joined:
             model = None
@@ -394,9 +401,18 @@ class Collector:
         if a0.startswith("python") and len(argv) > 2 and argv[1] == "-c":
             return a0 + " -c … " + " ".join(argv[3:6])
         if a0.startswith("python") and len(argv) > 1:
-            rest = [a for a in argv[1:] if not a.startswith("-") or a == "-m"]
-            return a0 + " " + " ".join(os.path.basename(x) if "/" in x else x for x in rest[:3])
-        return (a0 + " " + " ".join(argv[1:3])).strip()
+            if "-m" in argv[1:-1]:
+                return a0 + " -m " + argv[argv.index("-m") + 1]
+            script = next((a for a in argv[1:] if not a.startswith("-")), "")
+            return (a0 + " " + os.path.basename(script)).strip()
+        # other programs: name, their role (--type=...) and plain arguments, no option noise
+        role = next((a[7:] for a in argv[1:] if a.startswith("--type=")), "")
+        plain = []
+        for a in argv[1:3]:
+            if a.startswith("-"):
+                break
+            plain.append(a)
+        return " ".join([a0] + plain) + (f" ({role})" if role else "")
 
     def procs(self, raw, now):
         merged = {}
@@ -962,7 +978,7 @@ class UI:
         self.put(r, ix, "util", self.c["d"])
         self.spark(r, ix + 5, hw, hist["gpu"], "g", 100)
         self.put(r, ix + 7 + hw, "watt", self.c["d"])
-        self.spark(r, ix + 12 + hw, hw, hist["power"], "m")
+        self.spark(r, ix + 12 + hw, hw, hist["power"], "m", max(hist["power"][-max(1, hw):] + [60]))
         y += gh
 
         # vLLM
@@ -1018,7 +1034,7 @@ class UI:
             self.seq(iy + 1 + i, ix, [("● " if up else "○ ", "g" if up else "d"),
                                       (f"{n['if'][:15]:<16}", "n" if up else "d"), (f"{link:>10}", "n" if up else "d"),
                                       (f"{fr(n['rx']):>13}", "g" if up else "d"), (f"{fr(n['tx']):>13}", "m" if up else "d"),
-                                      (f"{n['err'] + n['drop']:>8}", "r" if n["err"] + n["drop"] else "d")])
+                                      (f"{n['err'] + n['drop']:>8}", "r" if n.get("err_new") else "d")])
         y += dh
 
         # processes
@@ -1044,7 +1060,7 @@ class UI:
     # -- view: mesh
     def draw_mesh(self, y):
         W = self.W
-        iy, ix, iw = self.box(y, 0, len(self.nodes) + 5, W, "Mesh", f"{len(self.nodes)} nodes")
+        iy, ix, iw = self.box(y, 0, len(self.nodes) + 5, W, "Mesh", f"{len(self.nodes)} node" + ("s" if len(self.nodes) != 1 else ""))
         self.put(iy, ix, f"  {'Node':<26}{'Latency':>8}{'CPU':>7}{'RAM':>20}{'GPU':>7}{'Temp':>7}"
                          f"{'Power':>8}{'tok/s':>9}{'run/wait':>12}{'Net RX/TX':>24}  Alerts", self.c["d"])
         tot = collections.Counter()
